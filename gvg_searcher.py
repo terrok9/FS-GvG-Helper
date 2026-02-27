@@ -503,7 +503,7 @@ def main():
     ap.add_argument("--letters", default=None, help="Letters to scan, e.g. A,B,C or A-D. Default: A-Z")
     ap.add_argument("--max-guilds", type=int, default=0, help="Stop after N guilds (0 = no limit)")
     ap.add_argument("--active-days", type=int, default=7, help="Active if inactive_days < this")
-    ap.add_argument("--min-participants", type=int, default=3, help="Min attackers required to initiate (your note says >2)")
+    ap.add_argument("--min-participants", type=int, default=2, help="Min attackers required to initiate (over 2 attackers)")
     ap.add_argument("--cookie", default=None, help='Paste browser "Cookie" request header here (recommended)')
     ap.add_argument("--email", default=None, help="Login email (best-effort login)")
     ap.add_argument("--password-env", default=None, help="Env var name holding password (best-effort login)")
