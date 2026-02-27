@@ -86,8 +86,8 @@ Install dependencies:
 
 ```bash
 pip install requests beautifulsoup4 lxml pandas openpyxl tqdm
+```
 
-```markdown
 ## 🔐 Security & Responsible Use (anti-ban + account safety)
 
 This tool behaves like a browser client and makes many requests. Use it carefully to reduce the chance of rate-limits, flags, or account compromise.
@@ -105,3 +105,4 @@ Passing cookies directly in CLI can break (PowerShell quoting) and can leak into
 Use:
 ```bash
 python gvg_searcher.py --cookie-file cookie.txt --attackers attackers.csv --out conflicts.xlsx
+```
