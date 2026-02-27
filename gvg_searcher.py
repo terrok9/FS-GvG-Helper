@@ -12,7 +12,8 @@ DISCLAIMER:
 """
 
 from __future__ import annotations
-
+import sys
+from tqdm.auto import tqdm
 import argparse
 import math
 import os
@@ -25,6 +26,11 @@ from urllib.parse import urljoin
 import pandas as pd
 import requests
 from bs4 import BeautifulSoup
+
+# We use openpyxl objects directly; import lazily to keep startup clean
+import openpyxl
+from openpyxl.styles import Font, Alignment
+from openpyxl.utils import get_column_letter
 
 
 # -----------------------------
@@ -459,10 +465,6 @@ def autosize_worksheet_columns(writer: pd.ExcelWriter, sheet_name: str, df: pd.D
         ws.column_dimensions[openpyxl.utils.get_column_letter(i)].width = width
 
 
-# We use openpyxl objects directly; import lazily to keep startup clean
-import openpyxl
-from openpyxl.styles import Font, Alignment
-from openpyxl.utils import get_column_letter
 
 
 def beautify_sheet(ws):
@@ -508,8 +510,11 @@ def main():
     ap.add_argument("--include-targets", action="store_true", help="Add Targets sheet (can get large)")
     ap.add_argument("--min-delay", type=float, default=0.35, help="Delay between requests (rate-limit)")
     ap.add_argument("--cookie-file", default=None, help="Path to a txt file containing the Cookie header value")
+    ap.add_argument("--no-progress", action="store_true", help="Disable progress bars")
 
     args = ap.parse_args()
+
+    progress_disabled = args.no_progress or (not sys.stderr.isatty())
 
     attackers = load_attackers_csv(args.attackers)
     password = os.getenv(args.password_env) if args.password_env else None
@@ -545,60 +550,87 @@ def main():
     targets_rows: List[dict] = []
 
     guild_count = 0
-    for letter in letters:
-        # Pages: many letters have multiple pages; without being logged in we can't detect count reliably.
-        # We'll probe up to 10 pages and stop when page yields no guilds.
-        for page in range(0, 10):
-            url = GUILD_ATOZ_URL.format(letter=letter, page=page)
-            html = client.get(url).text
-            guilds = parse_guild_list(html)
-            if not guilds:
-                # no more pages for this letter
-                break
 
-            for g in guilds:
-                guild_count += 1
+    letters_pbar = tqdm(letters, desc="Scanning letters", unit="letter", disable=progress_disabled)
+
+    for letter in letters_pbar:
+        # Inner bar: guilds found for THIS letter (total grows as we discover pages)
+        guilds_pbar = tqdm(
+            total=0,
+            desc=f"Letter {letter} - guilds",
+            unit="guild",
+            leave=False,
+            disable=progress_disabled,
+        )
+
+        try:
+            for page in range(0, 10):
+                letters_pbar.set_postfix_str(f"letter={letter}, page={page+1}")
+
+                url = GUILD_ATOZ_URL.format(letter=letter, page=page)
+                html = client.get(url).text
+                guilds = parse_guild_list(html)
+
+                if not guilds:
+                    break  # no more pages for this letter
+
+                # Increase inner progress total as we discover more guilds
+                guilds_pbar.total += len(guilds)
+                guilds_pbar.refresh()
+
+                for g in guilds:
+                    guild_count += 1
+                    if args.max_guilds and guild_count > args.max_guilds:
+                        break
+
+                    # Show current guild name in the inner progress bar
+                    guilds_pbar.set_postfix_str(f"{g.name} (id={g.guild_id})")
+
+                    g_html = client.get(GUILD_VIEW_URL.format(guild_id=g.guild_id)).text
+                    members = parse_guild_members(g_html)
+
+                    summary, coverage_rows, _ = evaluate_guild_conflicts(
+                        g,
+                        members,
+                        attackers,
+                        active_days_threshold=args.active_days,
+                        min_initiator_participants=args.min_participants,
+                    )
+                    summaries.append(summary)
+                    coverages.extend(coverage_rows)
+
+                    if args.include_targets:
+                        active_50plus = [
+                            m for m in members
+                            if (m.inactive_days is not None and m.inactive_days < args.active_days and m.level >= 50)
+                        ]
+                        for t in active_50plus:
+                            hitters = [a.name for a in attackers if can_attack(a.level, t.level)]
+                            if not hitters:
+                                continue
+                            targets_rows.append({
+                                "guild_id": g.guild_id,
+                                "guild_name": g.name,
+                                "player_id": t.player_id,
+                                "player_name": t.name,
+                                "level": t.level,
+                                "inactive_days": t.inactive_days,
+                                "hitters": ", ".join(hitters),
+                                "profile_url": t.profile_url,
+                            })
+
+                    guilds_pbar.update(1)
+
                 if args.max_guilds and guild_count > args.max_guilds:
                     break
 
-                g_html = client.get(GUILD_VIEW_URL.format(guild_id=g.guild_id)).text
-                members = parse_guild_members(g_html)
-
-                summary, coverage_rows, _ = evaluate_guild_conflicts(
-                    g,
-                    members,
-                    attackers,
-                    active_days_threshold=args.active_days,
-                    min_initiator_participants=args.min_participants,
-                )
-                summaries.append(summary)
-                coverages.extend(coverage_rows)
-
-                if args.include_targets:
-                    # build per-target rows for eligible active targets
-                    active_50plus = [
-                        m for m in members
-                        if (m.inactive_days is not None and m.inactive_days < args.active_days and m.level >= 50)
-                    ]
-                    for t in active_50plus:
-                        hitters = [a.name for a in attackers if can_attack(a.level, t.level)]
-                        if not hitters:
-                            continue
-                        targets_rows.append({
-                            "guild_id": g.guild_id,
-                            "guild_name": g.name,
-                            "player_id": t.player_id,
-                            "player_name": t.name,
-                            "level": t.level,
-                            "inactive_days": t.inactive_days,
-                            "hitters": ", ".join(hitters),
-                            "profile_url": t.profile_url,
-                        })
-
             if args.max_guilds and guild_count > args.max_guilds:
                 break
-        if args.max_guilds and guild_count > args.max_guilds:
-            break
+
+        finally:
+            guilds_pbar.close()
+
+    letters_pbar.close()
 
     # Export
     df_conf = pd.DataFrame(summaries).sort_values(
