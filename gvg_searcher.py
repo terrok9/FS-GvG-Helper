@@ -31,6 +31,9 @@ from bs4 import BeautifulSoup
 import openpyxl
 from openpyxl.styles import Font, Alignment
 from openpyxl.utils import get_column_letter
+from openpyxl.styles import PatternFill
+from openpyxl.formatting.rule import CellIsRule
+from openpyxl.worksheet.datavalidation import DataValidation
 
 
 # -----------------------------
@@ -464,6 +467,65 @@ def autosize_worksheet_columns(writer: pd.ExcelWriter, sheet_name: str, df: pd.D
         width = min(max_len + 2, max_width)
         ws.column_dimensions[openpyxl.utils.get_column_letter(i)].width = width
 
+def format_guild_attacker_matrix_sheet(ws, df: pd.DataFrame):
+    """
+    Apply:
+    - freeze panes / header style
+    - dropdown validation with only ✓ or X
+    - green/red conditional formatting
+    """
+    beautify_sheet(ws)
+    autosize_openpyxl(ws, df)
+
+    if df.empty or df.shape[1] <= 1:
+        return
+
+    max_row = ws.max_row
+    max_col = ws.max_column
+
+    # Matrix area excludes first column (guild_name)
+    start_row = 2
+    start_col = 2
+    end_row = max_row
+    end_col = max_col
+
+    matrix_range = f"{get_column_letter(start_col)}{start_row}:{get_column_letter(end_col)}{end_row}"
+
+    # Center align matrix cells
+    for row in ws.iter_rows(min_row=start_row, max_row=end_row, min_col=start_col, max_col=end_col):
+        for cell in row:
+            cell.alignment = Alignment(horizontal="center", vertical="center")
+
+    # Wider first column for guild names
+    ws.column_dimensions["A"].width = min(max(ws.column_dimensions["A"].width, 32), 60)
+
+    # Dropdown: only ✓ or X
+    dv = DataValidation(
+        type="list",
+        formula1='"✓,X"',
+        allow_blank=False,
+        showDropDown=False,
+    )
+    dv.prompt = "Choose ✓ or X"
+    dv.promptTitle = "Guild/Attacker Flag"
+    dv.error = "Only ✓ or X is allowed."
+    dv.errorTitle = "Invalid value"
+    ws.add_data_validation(dv)
+    dv.add(matrix_range)
+
+    # Conditional formatting
+    green_fill = PatternFill(fill_type="solid", start_color="C6EFCE", end_color="C6EFCE")
+    red_fill = PatternFill(fill_type="solid", start_color="FFC7CE", end_color="FFC7CE")
+
+    ws.conditional_formatting.add(
+        matrix_range,
+        CellIsRule(operator="equal", formula=['"✓"'], fill=green_fill)
+    )
+    ws.conditional_formatting.add(
+        matrix_range,
+        CellIsRule(operator="equal", formula=['"X"'], fill=red_fill)
+    )
+
 
 
 
@@ -493,6 +555,133 @@ def load_attackers_csv(path: str) -> List[Attacker]:
     for _, r in df.iterrows():
         out.append(Attacker(name=str(r["name"]).strip(), level=int(r["level"])))
     return out
+
+def level_bracket_info(level: int) -> dict:
+    """
+    Returns the attack bracket info based on the player's own level.
+    This is the bracket used when the attacker is the lower/equal side.
+    """
+    if level < 50:
+        return {
+            "bracket": "Below 50 (not conflict-eligible)",
+            "delta": 0,
+            "band_start": None,
+            "band_end": None,
+        }
+    if 50 <= level <= 300:
+        return {"bracket": "50-300", "delta": 25, "band_start": 50, "band_end": 300}
+    if 301 <= level <= 700:
+        return {"bracket": "301-700", "delta": 50, "band_start": 301, "band_end": 700}
+    if 701 <= level <= 1000:
+        return {"bracket": "701-1000", "delta": 100, "band_start": 701, "band_end": 1000}
+
+    # 1001-2000 -> 125, 2001-3000 -> 150, ...
+    band_idx = (level - 1001) // 1000
+    band_start = 1001 + band_idx * 1000
+    band_end = band_start + 999
+    delta = 125 + band_idx * 25
+
+    return {
+        "bracket": f"{band_start}-{band_end}",
+        "delta": delta,
+        "band_start": band_start,
+        "band_end": band_end,
+    }
+
+
+def exact_lowest_hittable_level(attacker_level: int) -> Optional[int]:
+    """
+    Exact lowest target level the attacker can hit under the 'lowest level determines range' rule.
+    We brute-force downward because the lower-side delta depends on the target's level.
+    """
+    if attacker_level < 50:
+        return None
+
+    for target_level in range(50, attacker_level + 1):
+        if can_attack(attacker_level, target_level):
+            return target_level
+    return None
+
+
+def exact_highest_hittable_level(attacker_level: int) -> Optional[int]:
+    """
+    Exact highest target level the attacker can hit.
+    For higher targets, the attacker is the lower level, so the range is based on attacker_level.
+    """
+    if attacker_level < 50:
+        return None
+    return attacker_level + range_delta(attacker_level)
+
+
+def build_guild_attacker_matrix(df_cov: pd.DataFrame, df_conf: pd.DataFrame, attackers: List[Attacker]) -> pd.DataFrame:
+    """
+    Rows   = guilds
+    Cols   = attackers
+    Values = ✓ if that attacker has at least one valid active target in that guild, else X
+
+    Only keep rows where at least 2 attackers have valid targets.
+    """
+    ordered_attackers = [a.name for a in attackers]
+
+    if df_cov.empty:
+        return pd.DataFrame(columns=["guild_name"] + ordered_attackers)
+
+    work = df_cov.copy()
+    work["guild_label"] = work["guild_name"] + " (" + work["guild_id"].astype(str) + ")"
+    work["has_targets"] = work["eligible_targets_active_<7d"] > 0
+
+    pivot = work.pivot_table(
+        index="guild_label",
+        columns="attacker",
+        values="has_targets",
+        aggfunc="max",
+        fill_value=False,
+    )
+
+    # Preserve attacker order from attackers.csv
+    pivot = pivot.reindex(columns=ordered_attackers, fill_value=False)
+
+    # Preserve guild order from Conflicts sheet
+    if not df_conf.empty:
+        guild_order = (df_conf["guild_name"] + " (" + df_conf["guild_id"].astype(str) + ")").tolist()
+        guild_order = [g for g in guild_order if g in pivot.index]
+        pivot = pivot.reindex(guild_order)
+
+    # Keep only guilds where 2 or more attackers have targets
+    pivot = pivot[pivot.sum(axis=1) >= 2]
+
+    # Convert bool -> symbols
+    pivot = pivot.astype(bool).replace({True: "✓", False: "X"})
+
+    pivot = pivot.reset_index().rename(columns={"guild_label": "guild_name"})
+    return pivot
+
+
+def build_attacker_sanity_df(attackers: List[Attacker]) -> pd.DataFrame:
+    """
+    For each attacker, show:
+    - own bracket
+    - own delta
+    - exact lowest hittable target level
+    - exact highest hittable target level
+    """
+    rows = []
+    for attacker in attackers:
+        info = level_bracket_info(attacker.level)
+        lowest = exact_lowest_hittable_level(attacker.level)
+        highest = exact_highest_hittable_level(attacker.level)
+
+        rows.append({
+            "attacker": attacker.name,
+            "attacker_level": attacker.level,
+            "own_bracket": info["bracket"],
+            "own_delta_for_higher_targets": info["delta"],
+            "lowest_hittable_target_level": lowest,
+            "highest_hittable_target_level": highest,
+            "target_span_width": (highest - lowest) if (lowest is not None and highest is not None) else None,
+        })
+
+    return pd.DataFrame(rows)
 
 
 def main():
@@ -639,23 +828,46 @@ def main():
         na_position="last",
     )
     df_cov = pd.DataFrame(coverages)
+    df_matrix = build_guild_attacker_matrix(df_cov, df_conf, attackers)
+    df_sanity = build_attacker_sanity_df(attackers)
 
     with pd.ExcelWriter(args.out, engine="openpyxl") as writer:
+        # Sheet 1
         df_conf.to_excel(writer, index=False, sheet_name="Conflicts")
+
+        # Sheet 2
         df_cov.to_excel(writer, index=False, sheet_name="AttackerCoverage")
+
+        # Sheet 3
+        df_matrix.to_excel(writer, index=False, sheet_name="GuildAttackerMatrix")
+
+        # Sheet 4
+        df_sanity.to_excel(writer, index=False, sheet_name="AttackerBracketSanity")
+
+        # Optional Sheet 5
         if args.include_targets:
             pd.DataFrame(targets_rows).to_excel(writer, index=False, sheet_name="Targets")
 
-        # Beautify
-        wb = writer.book
         for name in writer.sheets:
             ws = writer.sheets[name]
-            beautify_sheet(ws)
+
             if name == "Conflicts":
+                beautify_sheet(ws)
                 autosize_openpyxl(ws, df_conf)
+
             elif name == "AttackerCoverage":
+                beautify_sheet(ws)
                 autosize_openpyxl(ws, df_cov)
+
+            elif name == "GuildAttackerMatrix":
+                format_guild_attacker_matrix_sheet(ws, df_matrix)
+
+            elif name == "AttackerBracketSanity":
+                beautify_sheet(ws)
+                autosize_openpyxl(ws, df_sanity)
+
             elif name == "Targets":
+                beautify_sheet(ws)
                 autosize_openpyxl(ws, pd.DataFrame(targets_rows))
 
     print(f"Saved: {args.out}")
